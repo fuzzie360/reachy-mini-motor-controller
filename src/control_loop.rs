@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Sender},
     time,
 };
 
@@ -109,7 +109,7 @@ pub struct ReachyMiniControlLoop {
     last_torque: Arc<Mutex<Result<bool, MotorError>>>,
     last_control_mode: Arc<Mutex<Result<u8, MotorError>>>,
     last_stats: Option<(Duration, Arc<Mutex<ControlLoopStats>>)>,
-    rx_raw_bytes: Arc<Mutex<Receiver<Vec<u8>>>>,
+    rx_raw_bytes: Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
     motor_name_id: HashMap<String, u8>,
 }
 
@@ -375,7 +375,7 @@ impl ReachyMiniControlLoop {
         let last_control_mode = Arc::new(Mutex::new(Ok(last_control_mode)));
         let last_control_mode_clone = last_control_mode.clone();
 
-        let (tx_raw_bytes, rx_raw_bytes) = mpsc::channel(1);
+        let (tx_raw_bytes, rx_raw_bytes) = std::sync::mpsc::channel();
 
         let loop_handle = std::thread::spawn(move || {
             run(
@@ -507,16 +507,40 @@ impl ReachyMiniControlLoop {
         addr: u8,
         length: u8,
     ) -> Result<Vec<u8>, MotorError> {
-        let command = MotorCommand::ReadRawBytes { id, addr, length };
-        self.push_command(command)
-            .map_err(|_| MotorError::CommunicationError())?;
-        let data = self
-            .rx_raw_bytes
-            .lock()
-            .unwrap()
-            .blocking_recv()
-            .ok_or(MotorError::CommunicationError())?;
-        Ok(data)
+        const MAX_RETRIES: u32 = 3;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        for attempt in 0..MAX_RETRIES {
+            let command = MotorCommand::ReadRawBytes { id, addr, length };
+            self.push_command(command)
+                .map_err(|_| MotorError::CommunicationError())?;
+
+            match self.rx_raw_bytes.lock().unwrap().recv_timeout(TIMEOUT) {
+                Ok(data) => {
+                    if attempt > 0 {
+                        log::info!(
+                            "async_read_raw_bytes(id={}, addr={}) recovered after {} retries",
+                            id, addr, attempt
+                        );
+                    }
+                    return Ok(data);
+                }
+                Err(_) if attempt < MAX_RETRIES - 1 => {
+                    log::warn!(
+                        "async_read_raw_bytes(id={}, addr={}) timed out (attempt {}/{}), retrying...",
+                        id, addr, attempt + 1, MAX_RETRIES
+                    );
+                }
+                Err(_) => {
+                    log::error!(
+                        "async_read_raw_bytes(id={}, addr={}) timed out after {} attempts",
+                        id, addr, MAX_RETRIES
+                    );
+                    return Err(MotorError::CommunicationError());
+                }
+            }
+        }
+        unreachable!()
     }
 
     pub fn async_write_raw_bytes(&self, id: u8, addr: u8, data: Vec<u8>) -> Result<(), MotorError> {
@@ -577,7 +601,7 @@ fn run(
     last_stats: Option<(Duration, Arc<Mutex<ControlLoopStats>>)>,
     read_position_loop_period: Duration,
     read_allowed_retries: u64,
-    tx_raw_bytes: Sender<Vec<u8>>,
+    tx_raw_bytes: std::sync::mpsc::Sender<Vec<u8>>,
 ) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let mut interval = time::interval(read_position_loop_period);
@@ -597,7 +621,7 @@ fn run(
                         if let Ok(res) = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command) {
                             if let Some(data) = res {
                             // This means we had a ReadRawBytes command
-                                tx_raw_bytes.send(data).await.unwrap();
+                                tx_raw_bytes.send(data).unwrap();
                             }
 
                             if last_stats.is_some() {
