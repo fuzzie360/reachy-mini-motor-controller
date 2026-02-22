@@ -511,6 +511,12 @@ impl ReachyMiniControlLoop {
         const TIMEOUT: Duration = Duration::from_secs(5);
 
         for attempt in 0..MAX_RETRIES {
+            // Drain any stale responses before retrying (e.g. late arrivals after a timeout)
+            if attempt > 0 {
+                let rx = self.rx_raw_bytes.lock().unwrap();
+                while rx.try_recv().is_ok() {}
+            }
+
             let command = MotorCommand::ReadRawBytes { id, addr, length };
             self.push_command(command)
                 .map_err(|_| MotorError::CommunicationError())?;
