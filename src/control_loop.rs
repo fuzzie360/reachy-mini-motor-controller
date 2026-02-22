@@ -110,6 +110,7 @@ pub struct ReachyMiniControlLoop {
     last_control_mode: Arc<Mutex<Result<u8, MotorError>>>,
     last_stats: Option<(Duration, Arc<Mutex<ControlLoopStats>>)>,
     rx_raw_bytes: Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    async_read_lock: Arc<Mutex<()>>,
     motor_name_id: HashMap<String, u8>,
 }
 
@@ -393,6 +394,7 @@ impl ReachyMiniControlLoop {
         });
 
         let rx_raw_bytes = Arc::new(Mutex::new(rx_raw_bytes));
+        let async_read_lock = Arc::new(Mutex::new(()));
 
         Ok(ReachyMiniControlLoop {
             loop_handle: Arc::new(Mutex::new(Some(loop_handle))),
@@ -403,6 +405,7 @@ impl ReachyMiniControlLoop {
             last_control_mode,
             last_stats,
             rx_raw_bytes,
+            async_read_lock,
             motor_name_id,
         })
     }
@@ -509,6 +512,16 @@ impl ReachyMiniControlLoop {
     ) -> Result<Vec<u8>, MotorError> {
         const MAX_RETRIES: u32 = 3;
         const TIMEOUT: Duration = Duration::from_secs(5);
+
+        // Hold the lock for the entire request+response cycle to prevent
+        // concurrent reads from interleaving their commands and responses.
+        let _lock = match self.async_read_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::error!("async_read_lock mutex was poisoned");
+                poisoned.into_inner()
+            }
+        };
 
         for attempt in 0..MAX_RETRIES {
             // Drain any stale responses before retrying (e.g. late arrivals after a timeout)
