@@ -516,7 +516,7 @@ impl ReachyMiniControlLoop {
                 .map_err(|_| MotorError::CommunicationError())?;
 
             match self.rx_raw_bytes.lock().unwrap().recv_timeout(TIMEOUT) {
-                Ok(data) => {
+                Ok(data) if data.len() == length as usize => {
                     if attempt > 0 {
                         log::info!(
                             "async_read_raw_bytes(id={}, addr={}) recovered after {} retries",
@@ -524,6 +524,19 @@ impl ReachyMiniControlLoop {
                         );
                     }
                     return Ok(data);
+                }
+                Ok(data) if attempt < MAX_RETRIES - 1 => {
+                    log::warn!(
+                        "async_read_raw_bytes(id={}, addr={}) returned {} bytes, expected {} (attempt {}/{}), retrying...",
+                        id, addr, data.len(), length, attempt + 1, MAX_RETRIES
+                    );
+                }
+                Ok(data) => {
+                    log::error!(
+                        "async_read_raw_bytes(id={}, addr={}) returned {} bytes, expected {} after {} attempts",
+                        id, addr, data.len(), length, MAX_RETRIES
+                    );
+                    return Err(MotorError::CommunicationError());
                 }
                 Err(_) if attempt < MAX_RETRIES - 1 => {
                     log::warn!(
