@@ -109,8 +109,6 @@ pub struct ReachyMiniControlLoop {
     last_torque: Arc<Mutex<Result<bool, MotorError>>>,
     last_control_mode: Arc<Mutex<Result<u8, MotorError>>>,
     last_stats: Option<(Duration, Arc<Mutex<ControlLoopStats>>)>,
-    rx_raw_bytes: Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
-    async_read_lock: Arc<Mutex<()>>,
     motor_name_id: HashMap<String, u8>,
 }
 
@@ -161,6 +159,7 @@ pub enum MotorCommand {
         id: u8,
         addr: u8,
         length: u8,
+        tx: std::sync::mpsc::Sender<Vec<u8>>,
     },
     WriteRawBytes {
         id: u8,
@@ -376,8 +375,6 @@ impl ReachyMiniControlLoop {
         let last_control_mode = Arc::new(Mutex::new(Ok(last_control_mode)));
         let last_control_mode_clone = last_control_mode.clone();
 
-        let (tx_raw_bytes, rx_raw_bytes) = std::sync::mpsc::channel();
-
         let loop_handle = std::thread::spawn(move || {
             run(
                 c,
@@ -389,12 +386,8 @@ impl ReachyMiniControlLoop {
                 last_stats_clone,
                 read_position_loop_period,
                 read_allowed_retries,
-                tx_raw_bytes,
             );
         });
-
-        let rx_raw_bytes = Arc::new(Mutex::new(rx_raw_bytes));
-        let async_read_lock = Arc::new(Mutex::new(()));
 
         Ok(ReachyMiniControlLoop {
             loop_handle: Arc::new(Mutex::new(Some(loop_handle))),
@@ -404,8 +397,6 @@ impl ReachyMiniControlLoop {
             last_torque,
             last_control_mode,
             last_stats,
-            rx_raw_bytes,
-            async_read_lock,
             motor_name_id,
         })
     }
@@ -513,28 +504,16 @@ impl ReachyMiniControlLoop {
         const MAX_RETRIES: u32 = 3;
         const TIMEOUT: Duration = Duration::from_secs(5);
 
-        // Hold the lock for the entire request+response cycle to prevent
-        // concurrent reads from interleaving their commands and responses.
-        let _lock = match self.async_read_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                log::error!("async_read_lock mutex was poisoned");
-                poisoned.into_inner()
-            }
-        };
-
         for attempt in 0..MAX_RETRIES {
-            // Drain any stale responses before retrying (e.g. late arrivals after a timeout)
-            if attempt > 0 {
-                let rx = self.rx_raw_bytes.lock().unwrap();
-                while rx.try_recv().is_ok() {}
-            }
+            // Each attempt gets its own channel so responses can never leak
+            // to other calls or retries.
+            let (tx, rx) = std::sync::mpsc::channel();
 
-            let command = MotorCommand::ReadRawBytes { id, addr, length };
+            let command = MotorCommand::ReadRawBytes { id, addr, length, tx };
             self.push_command(command)
                 .map_err(|_| MotorError::CommunicationError())?;
 
-            match self.rx_raw_bytes.lock().unwrap().recv_timeout(TIMEOUT) {
+            match rx.recv_timeout(TIMEOUT) {
                 Ok(data) if data.len() == length as usize => {
                     if attempt > 0 {
                         log::info!(
@@ -633,7 +612,6 @@ fn run(
     last_stats: Option<(Duration, Arc<Mutex<ControlLoopStats>>)>,
     read_position_loop_period: Duration,
     read_allowed_retries: u64,
-    tx_raw_bytes: std::sync::mpsc::Sender<Vec<u8>>,
 ) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let mut interval = time::interval(read_position_loop_period);
@@ -650,12 +628,7 @@ fn run(
                 maybe_command = rx.recv() => {
                     if let Some(command) = maybe_command {
                         let write_tick = std::time::Instant::now();
-                        if let Ok(res) = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command) {
-                            if let Some(data) = res {
-                            // This means we had a ReadRawBytes command
-                                tx_raw_bytes.send(data).unwrap();
-                            }
-
+                        if let Ok(()) = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command) {
                             if last_stats.is_some() {
                                 let elapsed = write_tick.elapsed().as_secs_f64();
                                 write_dt.push(elapsed);
@@ -729,7 +702,7 @@ fn handle_commands(
     last_torque: Arc<Mutex<Result<bool, MotorError>>>,
     last_control_mode: Arc<Mutex<Result<u8, MotorError>>>,
     command: MotorCommand,
-) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     use MotorCommand::*;
 
     match command {
@@ -745,13 +718,13 @@ fn handle_commands(
                 positions.antennas[0],
                 positions.antennas[1],
             ])
-            .map(|_| None),
+            .map(|_| ()),
         SetStewartPlatformPosition { position } => controller
             .set_stewart_platform_position(position)
-            .map(|_| None),
-        SetBodyRotation { position } => controller.set_body_rotation(position).map(|_| None),
+            .map(|_| ()),
+        SetBodyRotation { position } => controller.set_body_rotation(position).map(|_| ()),
         SetAntennasPositions { positions } => {
-            controller.set_antennas_positions(positions).map(|_| None)
+            controller.set_antennas_positions(positions).map(|_| ())
         }
         EnableTorque() => {
             let res = controller.enable_torque();
@@ -760,7 +733,7 @@ fn handle_commands(
             {
                 *torque = Ok(true);
             }
-            res.map(|_| None)
+            res.map(|_| ())
         }
         EnableTorqueOnIds { ids } => {
             let res = controller.enable_torque_on_ids(&ids);
@@ -769,7 +742,7 @@ fn handle_commands(
             {
                 *torque = Ok(true);
             }
-            res.map(|_| None)
+            res.map(|_| ())
         }
         DisableTorque() => {
             let res = controller.disable_torque();
@@ -778,7 +751,7 @@ fn handle_commands(
             {
                 *torque = Ok(false);
             }
-            res.map(|_| None)
+            res.map(|_| ())
         }
         DisableTorqueOnIds { ids } => {
             let res = controller.disable_torque_on_ids(&ids);
@@ -787,11 +760,11 @@ fn handle_commands(
             {
                 *torque = Ok(false);
             }
-            res.map(|_| None)
+            res.map(|_| ())
         }
         SetStewartPlatformGoalCurrent { current } => controller
             .set_stewart_platform_goal_current(current)
-            .map(|_| None),
+            .map(|_| ()),
         SetStewartPlatformOperatingMode { mode } => {
             let res = controller.set_stewart_platform_operating_mode(mode);
             if res.is_ok()
@@ -799,30 +772,31 @@ fn handle_commands(
             {
                 *control_mode = Ok(mode);
             }
-            res.map(|_| None)
+            res.map(|_| ())
         }
         SetAntennasOperatingMode { mode } => {
-            controller.set_antennas_operating_mode(mode).map(|_| None)
+            controller.set_antennas_operating_mode(mode).map(|_| ())
         }
         SetBodyRotationOperatingMode { mode } => controller
             .set_body_rotation_operating_mode(mode)
-            .map(|_| None),
+            .map(|_| ()),
         EnableStewartPlatform { enable } => {
-            controller.enable_stewart_platform(enable).map(|_| None)
+            controller.enable_stewart_platform(enable).map(|_| ())
         }
-        EnableBodyRotation { enable } => controller.enable_body_rotation(enable).map(|_| None),
-        EnableAntennas { enable } => controller.enable_antennas(enable).map(|_| None),
-        ReadRawBytes { id, addr, length } => {
+        EnableBodyRotation { enable } => controller.enable_body_rotation(enable).map(|_| ()),
+        EnableAntennas { enable } => controller.enable_antennas(enable).map(|_| ()),
+        ReadRawBytes { id, addr, length, tx } => {
             let data = controller.read_raw_bytes(id, addr, length)?;
-            Ok(Some(data))
+            let _ = tx.send(data);
+            Ok(())
         }
         WriteRawBytes { id, addr, data } => {
-            controller.write_raw_bytes(id, addr, &data).map(|_| None)
+            controller.write_raw_bytes(id, addr, &data).map(|_| ())
         }
         WriteRawPacket { packet, tx } => {
             let response = controller.write_raw_packet(&packet)?;
             tx.send(response)?;
-            Ok(None)
+            Ok(())
         }
     }
 }
