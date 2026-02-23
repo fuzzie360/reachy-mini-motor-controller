@@ -501,57 +501,12 @@ impl ReachyMiniControlLoop {
         addr: u8,
         length: u8,
     ) -> Result<Vec<u8>, MotorError> {
-        const MAX_RETRIES: u32 = 3;
-        const TIMEOUT: Duration = Duration::from_secs(5);
-
-        for attempt in 0..MAX_RETRIES {
-            // Each attempt gets its own channel so responses can never leak
-            // to other calls or retries.
-            let (tx, rx) = std::sync::mpsc::channel();
-
-            let command = MotorCommand::ReadRawBytes { id, addr, length, tx };
-            self.push_command(command)
-                .map_err(|_| MotorError::CommunicationError())?;
-
-            match rx.recv_timeout(TIMEOUT) {
-                Ok(data) if data.len() == length as usize => {
-                    if attempt > 0 {
-                        log::info!(
-                            "async_read_raw_bytes(id={}, addr={}) recovered after {} retries",
-                            id, addr, attempt
-                        );
-                    }
-                    return Ok(data);
-                }
-                Ok(data) if attempt < MAX_RETRIES - 1 => {
-                    log::warn!(
-                        "async_read_raw_bytes(id={}, addr={}) returned {} bytes, expected {} (attempt {}/{}), retrying...",
-                        id, addr, data.len(), length, attempt + 1, MAX_RETRIES
-                    );
-                }
-                Ok(data) => {
-                    log::error!(
-                        "async_read_raw_bytes(id={}, addr={}) returned {} bytes, expected {} after {} attempts",
-                        id, addr, data.len(), length, MAX_RETRIES
-                    );
-                    return Err(MotorError::CommunicationError());
-                }
-                Err(_) if attempt < MAX_RETRIES - 1 => {
-                    log::warn!(
-                        "async_read_raw_bytes(id={}, addr={}) timed out (attempt {}/{}), retrying...",
-                        id, addr, attempt + 1, MAX_RETRIES
-                    );
-                }
-                Err(_) => {
-                    log::error!(
-                        "async_read_raw_bytes(id={}, addr={}) timed out after {} attempts",
-                        id, addr, MAX_RETRIES
-                    );
-                    return Err(MotorError::CommunicationError());
-                }
-            }
-        }
-        unreachable!()
+        let (tx, rx) = std::sync::mpsc::channel();
+        let command = MotorCommand::ReadRawBytes { id, addr, length, tx };
+        self.push_command(command)
+            .map_err(|_| MotorError::CommunicationError())?;
+        rx.recv_timeout(Duration::from_secs(1))
+            .map_err(|_| MotorError::CommunicationError())
     }
 
     pub fn async_write_raw_bytes(&self, id: u8, addr: u8, data: Vec<u8>) -> Result<(), MotorError> {
@@ -628,7 +583,7 @@ fn run(
                 maybe_command = rx.recv() => {
                     if let Some(command) = maybe_command {
                         let write_tick = std::time::Instant::now();
-                        if let Ok(()) = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command) {
+                        if handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command, read_allowed_retries).is_ok() {
                             if last_stats.is_some() {
                                 let elapsed = write_tick.elapsed().as_secs_f64();
                                 write_dt.push(elapsed);
@@ -688,7 +643,7 @@ fn run(
                         break;
                     }
                     if let Some(command) = rx.recv().await {
-                        let _ = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command);
+                        let _ = handle_commands(&mut c, last_torque.clone(), last_control_mode.clone(), command, read_allowed_retries);
                     }
                 }
                 break;
@@ -702,6 +657,7 @@ fn handle_commands(
     last_torque: Arc<Mutex<Result<bool, MotorError>>>,
     last_control_mode: Arc<Mutex<Result<u8, MotorError>>>,
     command: MotorCommand,
+    read_allowed_retries: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use MotorCommand::*;
 
@@ -786,7 +742,10 @@ fn handle_commands(
         EnableBodyRotation { enable } => controller.enable_body_rotation(enable).map(|_| ()),
         EnableAntennas { enable } => controller.enable_antennas(enable).map(|_| ()),
         ReadRawBytes { id, addr, length, tx } => {
-            let data = controller.read_raw_bytes(id, addr, length)?;
+            let data = with_retry(
+                || controller.read_raw_bytes(id, addr, length),
+                read_allowed_retries,
+            )?;
             let _ = tx.send(data);
             Ok(())
         }
